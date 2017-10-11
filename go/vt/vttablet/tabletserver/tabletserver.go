@@ -860,7 +860,7 @@ func (tsv *TabletServer) Execute(ctx context.Context, target *querypb.Target, sq
 				bindVariables = make(map[string]*querypb.BindVariable)
 			}
 			query, comments := sqlparser.SplitTrailingComments(sql)
-			plan, err := tsv.qe.GetPlan(ctx, logStats, query)
+			plan, err := tsv.qe.GetPlan(ctx, logStats, query, skipQueryPlanCache(options))
 			if err != nil {
 				return err
 			}
@@ -932,7 +932,28 @@ func (tsv *TabletServer) ExecuteBatch(ctx context.Context, target *querypb.Targe
 		return nil, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "cannot start a new transaction in the scope of an existing one")
 	}
 
+	if tsv.enableHotRowProtection && asTransaction && len(queries) == 1 {
+		// Serialize transactions which target the same hot row range.
+		// NOTE: We put this intentionally at this place *before* tsv.startRequest()
+		// gets called below. Otherwise, the startRequest()/endRequest() section from
+		// below would overlap with the startRequest()/endRequest() section executed
+		// by tsv.beginWaitForSameRangeTransactions().
+		txDone, err := tsv.beginWaitForSameRangeTransactions(ctx, target, options, queries[0].Sql, queries[0].BindVariables)
+		if err != nil {
+			return nil, err
+		}
+		if txDone != nil {
+			defer txDone()
+		}
+	}
+
 	allowOnShutdown := (transactionID != 0)
+	// TODO(sougou): Convert startRequest/endRequest pattern to use wrapper
+	// function tsv.execRequest() instead.
+	// Note that below we always return "err" right away and do not call
+	// tsv.convertAndLogError. That's because the methods which returned "err",
+	// e.g. tsv.Execute(), already called that function and therefore already
+	// converted and logged the error.
 	if err = tsv.startRequest(ctx, target, false, allowOnShutdown); err != nil {
 		return nil, err
 	}
@@ -942,7 +963,7 @@ func (tsv *TabletServer) ExecuteBatch(ctx context.Context, target *querypb.Targe
 	if asTransaction {
 		transactionID, err = tsv.Begin(ctx, target, options)
 		if err != nil {
-			return nil, tsv.convertAndLogError(ctx, "batch", nil, err, nil)
+			return nil, err
 		}
 		// If transaction was not committed by the end, it means
 		// that there was an error, roll it back.
@@ -956,14 +977,14 @@ func (tsv *TabletServer) ExecuteBatch(ctx context.Context, target *querypb.Targe
 	for _, bound := range queries {
 		localReply, err := tsv.Execute(ctx, target, bound.Sql, bound.BindVariables, transactionID, options)
 		if err != nil {
-			return nil, tsv.convertAndLogError(ctx, "batch", nil, err, nil)
+			return nil, err
 		}
 		results = append(results, *localReply)
 	}
 	if asTransaction {
 		if err = tsv.Commit(ctx, target, transactionID); err != nil {
 			transactionID = 0
-			return nil, tsv.convertAndLogError(ctx, "batch", nil, err, nil)
+			return nil, err
 		}
 		transactionID = 0
 	}
@@ -1038,7 +1059,7 @@ func (tsv *TabletServer) beginWaitForSameRangeTransactions(ctx context.Context, 
 func (tsv *TabletServer) computeTxSerializerKey(ctx context.Context, logStats *tabletenv.LogStats, sql string, bindVariables map[string]*querypb.BindVariable) (string, string) {
 	// Strip trailing comments so we don't pollute the query cache.
 	sql, _ = sqlparser.SplitTrailingComments(sql)
-	plan, err := tsv.qe.GetPlan(ctx, logStats, sql)
+	plan, err := tsv.qe.GetPlan(ctx, logStats, sql, false /* skipQueryPlanCache */)
 	if err != nil {
 		logComputeRowSerializerKey.Errorf("failed to get plan for query: %v err: %v", sql, err)
 		return "", ""
@@ -1068,6 +1089,8 @@ func (tsv *TabletServer) computeTxSerializerKey(ctx context.Context, logStats *t
 
 // BeginExecuteBatch combines Begin and ExecuteBatch.
 func (tsv *TabletServer) BeginExecuteBatch(ctx context.Context, target *querypb.Target, queries []*querypb.BoundQuery, asTransaction bool, options *querypb.ExecuteOptions) ([]sqltypes.Result, int64, error) {
+	// TODO(mberlin): Integrate hot row protection here as we did for BeginExecute()
+	// and ExecuteBatch(asTransaction=true).
 	transactionID, err := tsv.Begin(ctx, target, options)
 	if err != nil {
 		return nil, 0, err
@@ -1314,7 +1337,19 @@ func (tsv *TabletServer) convertAndLogError(ctx context.Context, sql string, bin
 	origErr := err
 	err = formatErrorWithCallerID(ctx, vterrors.New(errCode, err.Error()))
 	if logMethod != nil {
-		logMethod("%v: %v", err, queryAsString(sql, bindVariables))
+		// In order to correctly truncate long queries in logs, combine
+		// the error (which contains both the mysql error string and the
+		// full query) with the unexpanded query + bind variables, then
+		// truncate the resulting string.
+		//
+		// This makes it so that the query portion of the logs is
+		// properly truncated to the expected max log length.
+		message := fmt.Sprintf("%v: %v", err, queryAsString(sql, bindVariables))
+		maxLen := *sqlparser.TruncateErrLen
+		if maxLen != 0 && len(message) > maxLen {
+			message = message[:maxLen-12] + " [TRUNCATED]"
+		}
+		logMethod(message)
 	}
 
 	// If TerseErrors is on, strip the error message returned by MySQL and only
@@ -1775,7 +1810,7 @@ func (tsv *TabletServer) endRequest(isTx bool) {
 
 // GetPlan is only used from vtexplain
 func (tsv *TabletServer) GetPlan(ctx context.Context, logStats *tabletenv.LogStats, sql string) (*TabletPlan, error) {
-	return tsv.qe.GetPlan(ctx, logStats, sql)
+	return tsv.qe.GetPlan(ctx, logStats, sql, false /* skipQueryPlanCache */)
 }
 
 func (tsv *TabletServer) registerDebugHealthHandler() {
@@ -1925,7 +1960,7 @@ func queryAsString(sql string, bindVariables map[string]*querypb.BindVariable) s
 		fmt.Fprintf(buf, "%s: %q", k, valString)
 	}
 	fmt.Fprintf(buf, "}")
-	return sqlparser.TruncateForLog(string(buf.Bytes()))
+	return string(buf.Bytes())
 }
 
 // withTimeout returns a context based on the specified timeout.
@@ -1936,4 +1971,12 @@ func withTimeout(ctx context.Context, timeout time.Duration, options *querypb.Ex
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, timeout)
+}
+
+// skipQueryPlanCache returns true if the query plan should be cached
+func skipQueryPlanCache(options *querypb.ExecuteOptions) bool {
+	if options == nil {
+		return false
+	}
+	return options.SkipQueryPlanCache
 }

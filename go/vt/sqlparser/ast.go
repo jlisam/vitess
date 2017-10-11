@@ -20,7 +20,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
+	"io"
 	"strings"
 
 	log "github.com/golang/glog"
@@ -43,7 +43,7 @@ import (
 // a set of types, define the function as iTypeName.
 // This will help avoid name collisions.
 
-// Parse parses the sql and returns a Statement, which
+// Parse parses the SQL in full and returns a Statement, which
 // is the AST representation of the query. If a DDL statement
 // is partially parsed but still contains a syntax error, the
 // error is ignored and the DDL is returned anyway.
@@ -55,7 +55,7 @@ func Parse(sql string) (Statement, error) {
 			tokenizer.ParseTree = tokenizer.partialDDL
 			return tokenizer.ParseTree, nil
 		}
-		return nil, vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, tokenizer.LastError)
+		return nil, vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, tokenizer.LastError.Error())
 	}
 	return tokenizer.ParseTree, nil
 }
@@ -65,7 +65,33 @@ func Parse(sql string) (Statement, error) {
 func ParseStrictDDL(sql string) (Statement, error) {
 	tokenizer := NewStringTokenizer(sql)
 	if yyParse(tokenizer) != 0 {
-		return nil, errors.New(tokenizer.LastError)
+		return nil, tokenizer.LastError
+	}
+	return tokenizer.ParseTree, nil
+}
+
+// ParseNext parses a single SQL statement from the tokenizer
+// returning a Statement which is the AST representation of the query.
+// The tokenizer will always read up to the end of the statement, allowing for
+// the next call to ParseNext to parse any subsequent SQL statements. When
+// there are no more statements to parse, a error of io.EOF is returned.
+func ParseNext(tokenizer *Tokenizer) (Statement, error) {
+	if tokenizer.lastChar == ';' {
+		tokenizer.next()
+		tokenizer.skipBlank()
+	}
+	if tokenizer.lastChar == eofChar {
+		return nil, io.EOF
+	}
+
+	tokenizer.reset()
+	tokenizer.multi = true
+	if yyParse(tokenizer) != 0 {
+		if tokenizer.partialDDL != nil {
+			tokenizer.ParseTree = tokenizer.partialDDL
+			return tokenizer.ParseTree, nil
+		}
+		return nil, tokenizer.LastError
 	}
 	return tokenizer.ParseTree, nil
 }
@@ -109,6 +135,10 @@ func Walk(visit Visit, nodes ...SQLNode) error {
 
 // String returns a string representation of an SQLNode.
 func String(node SQLNode) string {
+	if node == nil {
+		return "<nil>"
+	}
+
 	buf := NewTrackedBuffer(nil)
 	buf.Myprintf("%v", node)
 	return buf.String()
@@ -358,6 +388,7 @@ func (node *Union) WalkSubtree(visit Visit) error {
 // the row and re-inserts with new values. For that reason we keep it as an Insert struct.
 // Replaces are currently disallowed in sharded schemas because
 // of the implications the deletion part may have on vindexes.
+// If you add fields here, consider adding them to calls to validateSubquerySamePlan.
 type Insert struct {
 	Action   string
 	Comments Comments
@@ -409,6 +440,7 @@ func (Values) iInsertRows()       {}
 func (*ParenSelect) iInsertRows() {}
 
 // Update represents an UPDATE statement.
+// If you add fields here, consider adding them to calls to validateSubquerySamePlan.
 type Update struct {
 	Comments   Comments
 	TableExprs TableExprs
@@ -442,6 +474,7 @@ func (node *Update) WalkSubtree(visit Visit) error {
 }
 
 // Delete represents a DELETE statement.
+// If you add fields here, consider adding them to calls to validateSubquerySamePlan.
 type Delete struct {
 	Comments   Comments
 	Targets    TableNames
@@ -2756,20 +2789,6 @@ func (node *TableIdent) UnmarshalJSON(b []byte) error {
 	}
 	node.v = result
 	return nil
-}
-
-// Backtick produces a backticked literal given an input string.
-func Backtick(in string) string {
-	var buf bytes.Buffer
-	buf.WriteByte('`')
-	for _, c := range in {
-		buf.WriteRune(c)
-		if c == '`' {
-			buf.WriteByte('`')
-		}
-	}
-	buf.WriteByte('`')
-	return buf.String()
 }
 
 func formatID(buf *TrackedBuffer, original, lowered string) {
