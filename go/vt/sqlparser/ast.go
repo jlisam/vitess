@@ -26,9 +26,10 @@ import (
 	log "github.com/golang/glog"
 
 	"github.com/youtube/vitess/go/sqltypes"
+	"github.com/youtube/vitess/go/vt/vterrors"
+
 	querypb "github.com/youtube/vitess/go/vt/proto/query"
 	vtrpcpb "github.com/youtube/vitess/go/vt/proto/vtrpc"
-	"github.com/youtube/vitess/go/vt/vterrors"
 )
 
 // Instructions for creating new types: If a type
@@ -728,7 +729,7 @@ type ColumnDefinition struct {
 
 // Format formats the node.
 func (col *ColumnDefinition) Format(buf *TrackedBuffer) {
-	buf.Myprintf("`%s` %v", col.Name.String(), &col.Type)
+	buf.Myprintf("%v %v", col.Name, &col.Type)
 }
 
 // WalkSubtree walks the nodes of the subtree.
@@ -753,6 +754,7 @@ type ColumnType struct {
 	NotNull       BoolVal
 	Autoincrement BoolVal
 	Default       *SQLVal
+	OnUpdate      *SQLVal
 	Comment       *SQLVal
 
 	// Numeric field options
@@ -805,6 +807,9 @@ func (ct *ColumnType) Format(buf *TrackedBuffer) {
 	}
 	if ct.Default != nil {
 		opts = append(opts, keywordStrings[DEFAULT], String(ct.Default))
+	}
+	if ct.OnUpdate != nil {
+		opts = append(opts, keywordStrings[ON], keywordStrings[UPDATE], String(ct.OnUpdate))
 	}
 	if ct.Autoincrement {
 		opts = append(opts, keywordStrings[AUTO_INCREMENT])
@@ -918,7 +923,7 @@ func (ct *ColumnType) SQLType() querypb.Type {
 		return sqltypes.Timestamp
 	case keywordStrings[YEAR]:
 		return sqltypes.Year
-	case keywordStrings[FLOAT]:
+	case keywordStrings[FLOAT_TYPE]:
 		return sqltypes.Float32
 	case keywordStrings[DOUBLE]:
 		return sqltypes.Float64
@@ -950,9 +955,9 @@ func (idx *IndexDefinition) Format(buf *TrackedBuffer) {
 	buf.Myprintf("%v (", idx.Info)
 	for i, col := range idx.Columns {
 		if i != 0 {
-			buf.Myprintf(", `%s`", col.Column.String())
+			buf.Myprintf(", %v", col.Column)
 		} else {
-			buf.Myprintf("`%s`", col.Column.String())
+			buf.Myprintf("%v", col.Column)
 		}
 		if col.Length != nil {
 			buf.Myprintf("(%v)", col.Length)
@@ -989,17 +994,13 @@ func (ii *IndexInfo) Format(buf *TrackedBuffer) {
 	if ii.Primary {
 		buf.Myprintf("%s", ii.Type)
 	} else {
-		buf.Myprintf("%s `%v`", ii.Type, ii.Name)
+		buf.Myprintf("%s %v", ii.Type, ii.Name)
 	}
 }
 
 // WalkSubtree walks the nodes of the subtree.
 func (ii *IndexInfo) WalkSubtree(visit Visit) error {
-	if err := Walk(visit, ii.Name); err != nil {
-		return err
-	}
-
-	return nil
+	return Walk(visit, ii.Name)
 }
 
 // IndexColumn describes a column in an index definition with optional length
@@ -2089,11 +2090,12 @@ type UnaryExpr struct {
 
 // UnaryExpr.Operator
 const (
-	UPlusStr  = "+"
-	UMinusStr = "-"
-	TildaStr  = "~"
-	BangStr   = "!"
-	BinaryStr = "binary "
+	UPlusStr   = "+"
+	UMinusStr  = "-"
+	TildaStr   = "~"
+	BangStr    = "!"
+	BinaryStr  = "binary "
+	UBinaryStr = "_binary "
 )
 
 // Format formats the node.
@@ -2415,10 +2417,7 @@ func (node *CaseExpr) WalkSubtree(visit Visit) error {
 			return err
 		}
 	}
-	if err := Walk(visit, node.Else); err != nil {
-		return err
-	}
-	return nil
+	return Walk(visit, node.Else)
 }
 
 // Default represents a DEFAULT expression.

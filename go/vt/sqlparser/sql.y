@@ -134,7 +134,7 @@ func forceEOF(yylex interface{}) {
 %left <bytes> '^'
 %right <bytes> '~' UNARY
 %left <bytes> COLLATE
-%right <bytes> BINARY
+%right <bytes> BINARY UNDERSCORE_BINARY
 %right <bytes> INTERVAL
 %nonassoc <bytes> '.'
 
@@ -245,7 +245,7 @@ func forceEOF(yylex interface{}) {
 %type <str> show_statement_type
 %type <columnType> column_type
 %type <columnType> int_type decimal_type numeric_type time_type char_type
-%type <optVal> length_opt column_default_opt column_comment_opt
+%type <optVal> length_opt column_default_opt column_comment_opt on_update_opt
 %type <str> charset_opt collate_opt
 %type <boolVal> unsigned_opt zero_fill_opt
 %type <LengthScaleOption> float_length_opt decimal_length_opt
@@ -480,13 +480,14 @@ table_column_list:
   }
 
 column_definition:
-  ID column_type null_opt column_default_opt auto_increment_opt column_key_opt column_comment_opt
+  ID column_type null_opt column_default_opt on_update_opt auto_increment_opt column_key_opt column_comment_opt
   {
     $2.NotNull = $3
     $2.Default = $4
-    $2.Autoincrement = $5
-    $2.KeyOpt = $6
-    $2.Comment = $7
+    $2.OnUpdate = $5
+    $2.Autoincrement = $6
+    $2.KeyOpt = $7
+    $2.Comment = $8
     $$ = &ColumnDefinition{Name: NewColIdent(string($1)), Type: $2}
   }
 column_type:
@@ -754,6 +755,19 @@ column_default_opt:
   {
     $$ = NewValArg($2)
   }
+| DEFAULT CURRENT_TIMESTAMP
+  {
+    $$ = NewValArg($2)
+  }
+
+on_update_opt:
+  {
+    $$ = nil
+  }
+| ON UPDATE CURRENT_TIMESTAMP
+{
+  $$ = NewValArg($3)
+}
 
 auto_increment_opt:
   {
@@ -1651,6 +1665,10 @@ value_expression:
 | BINARY value_expression %prec UNARY
   {
     $$ = &UnaryExpr{Operator: BinaryStr, Expr: $2}
+  }
+| UNDERSCORE_BINARY value_expression %prec UNARY
+  {
+    $$ = &UnaryExpr{Operator: UBinaryStr, Expr: $2}
   }
 | '+'  value_expression %prec UNARY
   {

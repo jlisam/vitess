@@ -32,7 +32,7 @@ func TestParseNextValid(t *testing.T) {
 		sql.WriteRune(';')
 	}
 
-	tokens := NewStringTokenizer(sql.String())
+	tokens := NewTokenizer(&sql)
 	for i, tcase := range validSQL {
 		input := tcase.input + ";"
 		want := tcase.output
@@ -66,7 +66,7 @@ func TestParseNextErrors(t *testing.T) {
 			continue
 		}
 
-		sql := tcase.input + " ; select 1 from t"
+		sql := tcase.input + "; select 1 from t"
 		tokens := NewStringTokenizer(sql)
 
 		// The first statement should be an error
